@@ -214,27 +214,58 @@ TOOLS = {
 
     # ---------- Annotation ----------
     "prokka": {
-        "name": "Prokka",
-        "category": "Annotation",
-        "description": "Rapid prokaryotic genome annotation",
-        "install_command": (
-            "apt-get update && apt-get install -y git perl bioperl ncbi-blast+ && "
-            "rm -f /opt/conda/bin/prokka || true && "
-            "git clone https://github.com/tseemann/prokka.git /opt/prokka && "
-            "cd /opt/prokka && /opt/prokka/bin/prokka --setupdb && "
-            "ln -sf /opt/prokka/bin/prokka /usr/local/bin/prokka && "
-            "ln -sf /usr/bin/blastp /usr/local/bin/blastp || true"
-        ),
-        "version_command": "prokka --version",
-        "parameters": [
-            {"name": "input", "label": "Genome FASTA", "type": "file", "required": True,
-             "extensions": [".fa", ".fna", ".fasta", ".fas"], "help": "Assembly in FASTA format"},
-            {"name": "prefix", "label": "Output prefix", "type": "text", "default": "prokka"},
-            {"name": "kingdom", "label": "Kingdom", "type": "select",
-             "options": ["Bacteria", "Archaea", "Mitochondria", "Viruses"], "default": "Bacteria"},
-            {"name": "cpus", "label": "CPUs", "type": "number", "default": 4}
-        ]
-    },
+    "name": "Prokka",
+    "category": "Annotation",
+    "description": "Rapid prokaryotic genome annotation",
+    "install_command": (
+        "set -e && "
+        "apt-get update && "
+        "apt-get install -y git perl bioperl ncbi-blast+ hmmer barrnap aragorn prodigal libdatetime-perl && "
+        "rm -rf /opt/prokka && "
+        "git clone https://github.com/tseemann/prokka.git /opt/prokka && "
+        "chmod +x /opt/prokka/bin/prokka && "
+        "ln -sf /opt/prokka/bin/prokka /usr/local/bin/prokka && "
+        "mkdir -p /opt/conda/bin && "
+        "ln -sf /opt/prokka/bin/prokka /opt/conda/bin/prokka && "
+        "export PATH=/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:$PATH && "
+        "/opt/prokka/bin/prokka --setupdb"
+    ),
+    "version_command": (
+        "bash -lc 'export PATH=/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:$PATH && "
+        "if command -v prokka >/dev/null 2>&1; then prokka --version; "
+        "elif [ -x /opt/prokka/bin/prokka ]; then /opt/prokka/bin/prokka --version; "
+        "else exit 1; fi'"
+    ),
+    "parameters": [
+        {
+            "name": "input",
+            "label": "Genome FASTA",
+            "type": "file",
+            "required": True,
+            "extensions": [".fa", ".fna", ".fasta", ".fas"],
+            "help": "Assembly in FASTA format"
+        },
+        {
+            "name": "prefix",
+            "label": "Output prefix",
+            "type": "text",
+            "default": "prokka"
+        },
+        {
+            "name": "kingdom",
+            "label": "Kingdom",
+            "type": "select",
+            "options": ["Bacteria", "Archaea", "Mitochondria", "Viruses"],
+            "default": "Bacteria"
+        },
+        {
+            "name": "cpus",
+            "label": "CPUs",
+            "type": "number",
+            "default": 4
+        }
+    ]
+},
     "prodigal": {
         "name": "Prodigal",
         "category": "Annotation",
@@ -910,60 +941,73 @@ async def run_install_job(job_id: str, tool_key: str, install_cmd: str, version_
     work_dir = RESULT_DIR / f"install_{tool_key}_{uuid.uuid4().hex[:8]}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # First, check if tool already exists in PATH
-    check_cmd = f"which {tool_key} 2>/dev/null || echo 'not found'"
-    check = run_shell(check_cmd)
-    if check["returncode"] == 0 and "not found" not in check["stdout"]:
-        append_log(job_id, f"[{now_str()}] {tool_key} already present in PATH. Verifying...\n")
+    if tool_key == "prokka":
+        check = run_shell(
+            "bash -lc 'export PATH=/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:$PATH && "
+            "if [ -x /opt/prokka/bin/prokka ]; then /opt/prokka/bin/prokka --version; "
+            "elif command -v prokka >/dev/null 2>&1; then prokka --version; "
+            "else exit 1; fi'",
+            work_dir
+        )
+    else:
+        check_cmd = f"which {tool_key} 2>/dev/null || echo 'not found'"
+        check = run_shell(check_cmd)
+
+    if check["returncode"] == 0 and "not found" not in (check["stdout"] or "").lower():
+        append_log(job_id, f"[{now_str()}] {tool_key} already present. Verifying...\n")
+
         if version_cmd:
             ver = run_shell(version_cmd, work_dir)
             if ver["returncode"] == 0:
-                append_log(job_id, f"[{now_str()}] Verification passed: {ver['stdout']}\n")
+                append_log(job_id, f"[{now_str()}] Verification passed:\n{ver['stdout']}\n")
                 conn = db()
                 cur = conn.cursor()
-                cur.execute("UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?", (job_id, tool_key))
+                cur.execute(
+                    "UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?",
+                    (job_id, tool_key)
+                )
                 conn.commit()
                 conn.close()
                 update_job(job_id, status="completed", finished_at=now_str(), returncode=0)
                 return
-            else:
-                append_log(job_id, f"[{now_str()}] Verification failed, will attempt installation.\n")
-        else:
-            conn = db()
-            cur = conn.cursor()
-            cur.execute("UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?", (job_id, tool_key))
-            conn.commit()
-            conn.close()
-            update_job(job_id, status="completed", finished_at=now_str(), returncode=0)
-            return
 
-    # Run installation
     await run_job_command(job_id, install_cmd, work_dir)
 
     job = get_job(job_id)
-    if job and job["returncode"] == 0 and version_cmd:
-        append_log(job_id, f"[{now_str()}] Verifying installation...\n")
-        ver = run_shell(version_cmd, work_dir)
-        if ver["returncode"] == 0:
-            append_log(job_id, f"[{now_str()}] Verification passed: {ver['stdout']}\n")
-            conn = db()
-            cur = conn.cursor()
-            cur.execute("UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?", (job_id, tool_key))
-            conn.commit()
-            conn.close()
+    if job and job["returncode"] == 0:
+        if version_cmd:
+            append_log(job_id, f"[{now_str()}] Verifying installation...\n")
+            ver = run_shell(version_cmd, work_dir)
+
+            if ver["returncode"] == 0:
+                append_log(job_id, f"[{now_str()}] Verification passed:\n{ver['stdout']}\n")
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?",
+                    (job_id, tool_key)
+                )
+                conn.commit()
+                conn.close()
+            else:
+                append_log(job_id, f"[{now_str()}] Verification failed:\n{ver['stderr']}\n")
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE tools SET installed = 0, install_job_id = ? WHERE tool_key = ?",
+                    (job_id, tool_key)
+                )
+                conn.commit()
+                conn.close()
         else:
-            append_log(job_id, f"[{now_str()}] Verification failed: {ver['stderr']}\n")
             conn = db()
             cur = conn.cursor()
-            cur.execute("UPDATE tools SET installed = 0, install_job_id = ? WHERE tool_key = ?", (job_id, tool_key))
+            cur.execute(
+                "UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?",
+                (job_id, tool_key)
+            )
             conn.commit()
             conn.close()
-    elif job and job["returncode"] == 0 and not version_cmd:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("UPDATE tools SET installed = 1, install_job_id = ? WHERE tool_key = ?", (job_id, tool_key))
-        conn.commit()
-        conn.close()
 
 async def run_builtin_assembly_stats(job_id: str, fasta_path: Path):
     work_dir = RESULT_DIR / job_id
@@ -1154,15 +1198,18 @@ async def api_run_tool_dynamic(req: ToolRunDynamicRequest):
     work_dir = RESULT_DIR / f"{req.tool_key}_{uuid.uuid4().hex[:8]}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # For Prokka, use full path to avoid conda version and set PATH to prioritize system blastp
+    env = os.environ.copy()
+    env["PATH"] = "/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
+
     if req.tool_key == "prokka":
-        cmd_parts = ["/usr/local/bin/prokka"]
-        # Override PATH to ensure system blastp is found first
-        env = os.environ.copy()
-        env["PATH"] = "/usr/local/bin:/usr/bin:" + env.get("PATH", "")
+        if os.path.exists("/opt/prokka/bin/prokka"):
+            cmd_parts = ["/opt/prokka/bin/prokka"]
+        elif os.path.exists("/usr/local/bin/prokka"):
+            cmd_parts = ["/usr/local/bin/prokka"]
+        else:
+            cmd_parts = ["prokka"]
     else:
         cmd_parts = [req.tool_key]
-        env = None
 
     for param in parameters:
         pname = param["name"]
@@ -1170,20 +1217,30 @@ async def api_run_tool_dynamic(req: ToolRunDynamicRequest):
             if param.get("required", False):
                 raise HTTPException(status_code=400, detail=f"Missing required parameter: {pname}")
             continue
+
         value = req.values[pname]
         if value is None or value == "":
             continue
+
         if param["type"] == "file":
             file_rec = get_file(value)
             if not file_rec:
                 raise HTTPException(status_code=400, detail=f"File not found for parameter {pname}")
+
             file_path = Path(file_rec["path"])
+
             if req.tool_key == "multiqc" and pname == "input_dir":
                 file_path = file_path.parent
-            cmd_parts.append(shlex.quote(str(file_path)))
+
+            if req.tool_key == "prokka":
+                cmd_parts.append(shlex.quote(str(file_path)))
+            else:
+                cmd_parts.append(shlex.quote(str(file_path)))
+
         elif param["type"] in ("text", "number", "select"):
             cmd_parts.append(f"--{pname}")
             cmd_parts.append(shlex.quote(str(value)))
+
         elif param["type"] == "flag":
             if value:
                 cmd_parts.append(f"--{pname}")
