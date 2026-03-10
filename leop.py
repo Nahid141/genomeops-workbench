@@ -19,11 +19,32 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 # ============================================================
+# SYSTEM SETUP (run once at startup)
+# ============================================================
+def setup_system():
+    """Enable universe repository and install common dependencies."""
+    try:
+        subprocess.run(
+            "apt-get update && "
+            "apt-get install -y software-properties-common && "
+            "add-apt-repository -y universe && "
+            "apt-get update && "
+            "apt-get install -y wget git python3-pip build-essential",
+            shell=True,
+            check=True,
+            capture_output=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"System setup warning: {e.stderr.decode()}")
+
+setup_system()
+
+# ============================================================
 # CONFIG
 # ============================================================
 
 APP_TITLE = "GenomeOps Workbench"
-APP_VERSION = "4.3.0"               # new version with live logs & cancellation
+APP_VERSION = "4.4.0"               # new version with full tool support & virus tools
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -42,14 +63,14 @@ PORT = int(os.getenv("PORT", "10000"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
-# Store running subprocesses for cancellation (job_id -> process)
 running_jobs: Dict[str, subprocess.Popen] = {}
 
 # ============================================================
-# TOOL CATALOG (extended)
+# TOOL CATALOG (extended with corrected install commands & new virus tools)
 # ============================================================
 
 TOOLS = {
+    # Existing tools with corrected install commands
     "fastqc": {
         "name": "FastQC",
         "category": "QC",
@@ -109,7 +130,7 @@ TOOLS = {
         "name": "Canu",
         "category": "Assembly",
         "description": "Long-read assembler (PacBio/ONT)",
-        "install_command": "conda install -c bioconda canu -y",
+        "install_command": "apt-get update && apt-get install -y canu",
         "version_command": "canu --version",
         "parameters": [
             {"name": "input", "label": "Long-read FASTQ", "type": "file", "required": True,
@@ -124,7 +145,7 @@ TOOLS = {
         "name": "Prokka",
         "category": "Annotation",
         "description": "Rapid prokaryotic genome annotation",
-        "install_command": "apt-get update && apt-get install -y prokka",
+        "install_command": "apt-get update && apt-get install -y software-properties-common && add-apt-repository -y universe && apt-get update && apt-get install -y prokka",
         "version_command": "prokka --version",
         "parameters": [
             {"name": "input", "label": "Genome FASTA", "type": "file", "required": True,
@@ -139,7 +160,7 @@ TOOLS = {
         "name": "MLST",
         "category": "Typing",
         "description": "Multi-locus sequence typing",
-        "install_command": "apt-get update && apt-get install -y mlst",
+        "install_command": "apt-get update && apt-get install -y software-properties-common && add-apt-repository -y universe && apt-get update && apt-get install -y mlst",
         "version_command": "mlst --version",
         "parameters": [
             {"name": "input", "label": "Genome FASTA", "type": "file", "required": True,
@@ -150,7 +171,7 @@ TOOLS = {
         "name": "ABRicate",
         "category": "AMR / Virulence",
         "description": "Mass screening of contigs for antimicrobial resistance genes",
-        "install_command": "apt-get update && apt-get install -y abricate",
+        "install_command": "apt-get update && apt-get install -y git ncbi-blast+ perl && git clone https://github.com/tseemann/abricate.git /opt/abricate && /opt/abricate/bin/abricate --setupdb && ln -s /opt/abricate/bin/abricate /usr/local/bin/abricate",
         "version_command": "abricate --version",
         "parameters": [
             {"name": "input", "label": "Genome FASTA", "type": "file", "required": True,
@@ -165,7 +186,7 @@ TOOLS = {
         "name": "IQ-TREE",
         "category": "Phylogeny",
         "description": "Efficient phylogenomic inference",
-        "install_command": "apt-get update && apt-get install -y iqtree",
+        "install_command": "wget -O /tmp/iqtree.tar.gz https://github.com/iqtree/iqtree2/releases/download/v2.3.6/iqtree-2.3.6-Linux.tar.gz && tar -xzf /tmp/iqtree.tar.gz -C /usr/local && ln -s /usr/local/iqtree-2.3.6-Linux/bin/iqtree2 /usr/local/bin/iqtree",
         "version_command": "iqtree --version",
         "parameters": [
             {"name": "input", "label": "Alignment file (PHYLIP/FASTA)", "type": "file", "required": True,
@@ -236,7 +257,7 @@ TOOLS = {
         "name": "seqkit",
         "category": "Utilities",
         "description": "FASTA/FASTQ manipulation toolkit",
-        "install_command": "conda install -c bioconda seqkit -y",
+        "install_command": "apt-get update && apt-get install -y seqkit",
         "version_command": "seqkit version",
         "parameters": [
             {"name": "command", "label": "Subcommand (e.g., stats, grep)", "type": "text", "required": True,
@@ -249,7 +270,7 @@ TOOLS = {
         "name": "Trimmomatic",
         "category": "QC",
         "description": "Flexible read trimming",
-        "install_command": "apt-get update && apt-get install -y trimmomatic",
+        "install_command": "apt-get update && apt-get install -y software-properties-common && add-apt-repository -y universe && apt-get update && apt-get install -y trimmomatic",
         "version_command": "trimmomatic -version",
         "parameters": [
             {"name": "r1", "label": "Read 1 FASTQ", "type": "file", "required": True,
@@ -267,7 +288,7 @@ TOOLS = {
         "name": "QUAST",
         "category": "Assembly",
         "description": "Quality assessment of genome assemblies",
-        "install_command": "pip install quast",
+        "install_command": "apt-get update && apt-get install -y python3-pip && pip3 install quast",
         "version_command": "quast --version",
         "parameters": [
             {"name": "input", "label": "Assembly FASTA", "type": "file", "required": True,
@@ -277,11 +298,127 @@ TOOLS = {
             {"name": "genes", "label": "Gene coordinates (GFF)", "type": "file", "required": False,
              "extensions": [".gff", ".gff3"], "help": "Annotation to evaluate gene content"}
         ]
+    },
+    # New virus-related tools
+    "prodigal": {
+        "name": "Prodigal",
+        "category": "Virus / Gene Prediction",
+        "description": "Prokaryotic gene finding (works for viruses)",
+        "install_command": "apt-get update && apt-get install -y prodigal",
+        "version_command": "prodigal -v",
+        "parameters": [
+            {"name": "input", "label": "Genome FASTA", "type": "file", "required": True,
+             "extensions": [".fa", ".fasta", ".fna"], "help": "Assembly to predict genes"},
+            {"name": "output", "label": "Output GFF file", "type": "text", "default": "genes.gff", "required": False},
+            {"name": "format", "label": "Output format", "type": "select", "options": ["gff", "gbk", "sqn"], "default": "gff", "required": False}
+        ]
+    },
+    "diamond": {
+        "name": "DIAMOND",
+        "category": "Virus / Alignment",
+        "description": "Protein sequence aligner (for viral protein searches)",
+        "install_command": "apt-get update && apt-get install -y diamond-aligner",
+        "version_command": "diamond --version",
+        "parameters": [
+            {"name": "query", "label": "Protein FASTA", "type": "file", "required": True,
+             "extensions": [".faa", ".fa"], "help": "Protein sequences to search"},
+            {"name": "db", "label": "Database (pre-formatted .dmnd)", "type": "file", "required": True,
+             "extensions": [".dmnd"], "help": "DIAMOND database file"},
+            {"name": "out", "label": "Output file", "type": "text", "default": "matches.tsv", "required": False},
+            {"name": "evalue", "label": "E-value threshold", "type": "number", "default": 0.001, "required": False}
+        ]
+    },
+    "hmmer": {
+        "name": "HMMER",
+        "category": "Virus / Profile Search",
+        "description": "Profile hidden Markov models for viral protein families",
+        "install_command": "apt-get update && apt-get install -y hmmer",
+        "version_command": "hmmscan -h",
+        "parameters": [
+            {"name": "hmm", "label": "HMM profile", "type": "file", "required": True,
+             "extensions": [".hmm"], "help": "Profile HMM database"},
+            {"name": "seq", "label": "Protein FASTA", "type": "file", "required": True,
+             "extensions": [".faa", ".fa"], "help": "Sequences to search against profile"},
+            {"name": "out", "label": "Output file", "type": "text", "default": "hits.txt", "required": False}
+        ]
+    },
+    "infernal": {
+        "name": "Infernal",
+        "category": "Virus / RNA Search",
+        "description": "RNA structure search (viral ncRNAs)",
+        "install_command": "apt-get update && apt-get install -y infernal",
+        "version_command": "cmsearch -h",
+        "parameters": [
+            {"name": "cm", "label": "Covariance model", "type": "file", "required": True,
+             "extensions": [".cm"], "help": "RNA family model"},
+            {"name": "seq", "label": "Nucleotide FASTA", "type": "file", "required": True,
+             "extensions": [".fa", ".fasta", ".fna"], "help": "Genome or contigs to search"},
+            {"name": "out", "label": "Output file", "type": "text", "default": "results.txt", "required": False}
+        ]
+    },
+    "minimap2": {
+        "name": "Minimap2",
+        "category": "Virus / Alignment",
+        "description": "Long-read aligner (viral mapping)",
+        "install_command": "apt-get update && apt-get install -y minimap2",
+        "version_command": "minimap2 --version",
+        "parameters": [
+            {"name": "target", "label": "Reference genome", "type": "file", "required": True,
+             "extensions": [".fa", ".fasta", ".mmi"], "help": "Reference (or index)"},
+            {"name": "query", "label": "Reads FASTQ", "type": "file", "required": True,
+             "extensions": [".fastq", ".fq", ".gz"], "help": "Long reads to align"},
+            {"name": "out", "label": "Output SAM", "type": "text", "default": "aln.sam", "required": False},
+            {"name": "threads", "label": "Threads", "type": "number", "default": 4, "required": False}
+        ]
+    },
+    "nanoplot": {
+        "name": "NanoPlot",
+        "category": "Virus / QC",
+        "description": "QC for Nanopore reads",
+        "install_command": "pip install nanoplot",
+        "version_command": "NanoPlot --version",
+        "parameters": [
+            {"name": "reads", "label": "Nanopore FASTQ", "type": "file", "required": True,
+             "extensions": [".fastq", ".fq", ".gz"], "help": "Long reads for QC"},
+            {"name": "outdir", "label": "Output directory", "type": "text", "default": "nanoplot_out", "required": False},
+            {"name": "threads", "label": "Threads", "type": "number", "default": 4, "required": False}
+        ]
+    },
+    "flye": {
+        "name": "Flye",
+        "category": "Virus / Assembly",
+        "description": "Long-read assembler (viral genomes)",
+        "install_command": "pip install flye",
+        "version_command": "flye --version",
+        "parameters": [
+            {"name": "reads", "label": "Long reads FASTQ", "type": "file", "required": True,
+             "extensions": [".fastq", ".fq", ".gz"], "help": "Nanopore/PacBio reads"},
+            {"name": "genome-size", "label": "Estimated genome size", "type": "text", "required": True,
+             "help": "e.g. 5m for 5 Mbp"},
+            {"name": "threads", "label": "Threads", "type": "number", "default": 4, "required": False},
+            {"name": "out-dir", "label": "Output directory", "type": "text", "default": "flye_out", "required": False}
+        ]
+    },
+    "racon": {
+        "name": "Racon",
+        "category": "Virus / Polishing",
+        "description": "Polisher for long-read assemblies",
+        "install_command": "apt-get update && apt-get install -y racon",
+        "version_command": "racon --version",
+        "parameters": [
+            {"name": "reads", "label": "Long reads FASTQ", "type": "file", "required": True,
+             "extensions": [".fastq", ".fq", ".gz"], "help": "Reads used for assembly"},
+            {"name": "overlaps", "label": "Overlaps (PAF)", "type": "file", "required": True,
+             "extensions": [".paf"], "help": "Overlap mapping from minimap2"},
+            {"name": "target", "label": "Assembly FASTA", "type": "file", "required": True,
+             "extensions": [".fa", ".fasta"], "help": "Draft assembly to polish"},
+            {"name": "out", "label": "Polished assembly", "type": "text", "default": "polished.fa", "required": False}
+        ]
     }
 }
 
 # ============================================================
-# SQLITE (with version_command and auto-migration)
+# SQLITE (unchanged except for version_command auto-migration)
 # ============================================================
 
 def db():
@@ -292,7 +429,7 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
-    # Create tables if they don't exist (with version_command)
+    # Create tables if they don't exist
     cur.execute("""
         CREATE TABLE IF NOT EXISTS files (
             file_id TEXT PRIMARY KEY,
@@ -321,7 +458,6 @@ def init_db():
             returncode INTEGER
         )
     """)
-    # Create tools table including version_command
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tools (
             tool_key TEXT PRIMARY KEY,
@@ -354,7 +490,7 @@ def init_db():
 init_db()
 
 # ============================================================
-# HELPERS
+# HELPERS (unchanged)
 # ============================================================
 
 def now_str() -> str:
@@ -590,7 +726,7 @@ def write_json(path: Path, obj: dict):
         json.dump(obj, f, indent=2)
 
 # ============================================================
-# RESTRICTED LINUX CONSOLE
+# RESTRICTED LINUX CONSOLE (unchanged)
 # ============================================================
 
 BLOCKED_PATTERNS = [
@@ -664,7 +800,7 @@ async def run_terminal_command(command: str, cwd: Path) -> dict:
     }
 
 # ============================================================
-# REQUEST MODELS
+# REQUEST MODELS (unchanged)
 # ============================================================
 
 class PasswordPayload(BaseModel):
@@ -689,14 +825,13 @@ class CancelJobRequest(BaseModel):
     password: str
 
 # ============================================================
-# ASYNC JOB RUNNERS (with cancellation support)
+# ASYNC JOB RUNNERS (unchanged)
 # ============================================================
 
 async def run_job_command(job_id: str, command: str, work_dir: Path):
     update_job(job_id, status="running", started_at=now_str(), result_dir=str(work_dir))
     append_log(job_id, f"[{now_str()}] Running in {work_dir}\n")
 
-    # Run in a thread so we can capture the Popen object
     loop = asyncio.get_event_loop()
     proc = await loop.run_in_executor(None, lambda: subprocess.Popen(
         command,
@@ -711,7 +846,6 @@ async def run_job_command(job_id: str, command: str, work_dir: Path):
     stdout, stderr = await loop.run_in_executor(None, proc.communicate)
     returncode = proc.returncode
 
-    # Remove from running jobs
     running_jobs.pop(job_id, None)
 
     (work_dir / "stdout.txt").write_text(stdout or "", encoding="utf-8")
@@ -735,7 +869,7 @@ async def run_install_job(job_id: str, tool_key: str, install_cmd: str, version_
     work_dir = RESULT_DIR / f"install_{tool_key}_{uuid.uuid4().hex[:8]}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # First, check if tool already exists in PATH
+    # Check if tool already exists in PATH
     check_cmd = f"which {tool_key} 2>/dev/null || echo 'not found'"
     check = run_shell(check_cmd)
     if check["returncode"] == 0 and "not found" not in check["stdout"]:
@@ -832,7 +966,7 @@ async def run_builtin_metadata_summary(job_id: str, csv_path: Path):
     )
 
 # ============================================================
-# ROUTES
+# ROUTES (unchanged – the same as original)
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -1067,7 +1201,7 @@ async def ws_job_log(ws: WebSocket, job_id: str):
     with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
         await ws.send_text(f.read())
 
-    # Watch for changes (simple polling, but could use inotify)
+    # Watch for changes (simple polling)
     last_size = log_path.stat().st_size
     try:
         while True:
@@ -1136,9 +1270,8 @@ async def ws_terminal(ws: WebSocket):
         return
 
 # ============================================================
-# FRONTEND (enhanced with live logs, cancellation, preview, search)
+# FRONTEND (unchanged – the HTML_PAGE from the original)
 # ============================================================
-
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -1300,7 +1433,7 @@ footer{background:#1e293b;color:#cbd5e1;padding:24px;border-radius:16px 16px 0 0
         <i class="fas fa-globe"></i> <a href="https://sites.google.com/view/nahiduzzaman-bau/home" target="_blank">sites.google.com/view/nahiduzzaman-bau</a><br>
         <i class="fas fa-envelope"></i> <a href="mailto:nahiduzzaman.2001055@bau.edu.bd">nahiduzzaman.2001055@bau.edu.bd</a>
       </p>
-      <p><small>Version 4.3.0 – GenomeOps Workbench</small></p>
+      <p><small>Version 4.4.0 – GenomeOps Workbench</small></p>
     </div>
   </footer>
 </div>
