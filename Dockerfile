@@ -29,9 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
+
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Optional: Miniforge for bioconda tools
 RUN mkdir -p /opt/conda && \
     curl -L -o /tmp/miniforge.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh" && \
     bash /tmp/miniforge.sh -b -p /opt/conda && \
@@ -49,10 +49,10 @@ RUN conda install -y -c conda-forge -c bioconda \
     canu \
     && conda clean -afy
 
-COPY app.py /app/app.py
+COPY . /app
 
 RUN mkdir -p /app/data/uploads /app/data/results /app/data/logs /app/data/workspace
 
 EXPOSE 10000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
+CMD ["uvicorn", "leop:app", "--host", "0.0.0.0", "--port", "10000"]
