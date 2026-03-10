@@ -10,6 +10,7 @@ import asyncio
 import subprocess
 import shlex
 import signal
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -23,7 +24,7 @@ from pydantic import BaseModel
 # ==============================================================================
 
 APP_TITLE = "GenomeOps Workbench"
-APP_VERSION = "1.2.2"  # fixed Prokka PATH issue
+APP_VERSION = "1.2.3"  # Incremented version with fixes
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -33,6 +34,7 @@ LOG_DIR = DATA_DIR / "logs"
 WORKSPACE_DIR = DATA_DIR / "workspace"
 DB_PATH = DATA_DIR / "app.db"
 
+# Create directories
 for d in [DATA_DIR, UPLOAD_DIR, RESULT_DIR, LOG_DIR, WORKSPACE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -42,6 +44,10 @@ PORT = int(os.getenv("PORT", "10000"))
 
 # Global store for running subprocesses (job_id -> Popen)
 running_jobs: Dict[str, subprocess.Popen] = {}
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -58,11 +64,11 @@ def setup_system():
             capture_output=True,
             timeout=120
         )
-        print("System setup completed successfully.")
+        logger.info("System setup completed successfully.")
     except subprocess.CalledProcessError as e:
-        print(f"System setup warning: {e.stderr.decode()}")
+        logger.warning(f"System setup warning: {e.stderr.decode()}")
     except Exception as e:
-        print(f"System setup exception: {e}")
+        logger.warning(f"System setup exception: {e}")
 
 setup_system()
 
@@ -211,7 +217,6 @@ TOOLS = {
         "name": "Prokka",
         "category": "Annotation",
         "description": "Rapid prokaryotic genome annotation",
-        # Install: remove conda version, use GitHub master, ensure correct PATH
         "install_command": (
             "apt-get update && apt-get install -y git perl bioperl ncbi-blast+ && "
             "rm -f /opt/conda/bin/prokka || true && "
@@ -457,74 +462,81 @@ def db():
     return conn
 
 def init_db():
-    conn = db()
-    cur = conn.cursor()
+    """Initialize database tables and insert tools if missing."""
+    try:
+        conn = db()
+        cur = conn.cursor()
 
-    # Files table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS files (
-            file_id TEXT PRIMARY KEY,
-            original_name TEXT,
-            saved_name TEXT,
-            path TEXT,
-            extension TEXT,
-            size_bytes INTEGER,
-            uploaded_at TEXT
-        )
-    """)
-
-    # Jobs table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            job_id TEXT PRIMARY KEY,
-            job_type TEXT,
-            title TEXT,
-            command TEXT,
-            status TEXT,
-            created_at TEXT,
-            started_at TEXT,
-            finished_at TEXT,
-            log_file TEXT,
-            result_dir TEXT,
-            stdout TEXT,
-            stderr TEXT,
-            returncode INTEGER
-        )
-    """)
-
-    # Tools table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS tools (
-            tool_key TEXT PRIMARY KEY,
-            name TEXT,
-            category TEXT,
-            description TEXT,
-            install_command TEXT,
-            version_command TEXT,
-            installed INTEGER DEFAULT 0,
-            install_job_id TEXT,
-            parameters TEXT
-        )
-    """)
-
-    # Add version_command column if missing (for upgrades)
-    cur.execute("PRAGMA table_info(tools)")
-    columns = [col[1] for col in cur.fetchall()]
-    if "version_command" not in columns:
-        cur.execute("ALTER TABLE tools ADD COLUMN version_command TEXT")
-
-    # Upsert tools from catalog
-    for key, t in TOOLS.items():
+        # Files table
         cur.execute("""
-            INSERT OR REPLACE INTO tools
-            (tool_key, name, category, description, install_command, version_command, parameters)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (key, t["name"], t["category"], t["description"],
-              t["install_command"], t.get("version_command", ""),
-              json.dumps(t["parameters"])))
+            CREATE TABLE IF NOT EXISTS files (
+                file_id TEXT PRIMARY KEY,
+                original_name TEXT,
+                saved_name TEXT,
+                path TEXT,
+                extension TEXT,
+                size_bytes INTEGER,
+                uploaded_at TEXT
+            )
+        """)
 
-    conn.commit()
-    conn.close()
+        # Jobs table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                job_type TEXT,
+                title TEXT,
+                command TEXT,
+                status TEXT,
+                created_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                log_file TEXT,
+                result_dir TEXT,
+                stdout TEXT,
+                stderr TEXT,
+                returncode INTEGER
+            )
+        """)
+
+        # Tools table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tools (
+                tool_key TEXT PRIMARY KEY,
+                name TEXT,
+                category TEXT,
+                description TEXT,
+                install_command TEXT,
+                version_command TEXT,
+                installed INTEGER DEFAULT 0,
+                install_job_id TEXT,
+                parameters TEXT
+            )
+        """)
+
+        # Ensure version_command column exists (for upgrades)
+        cur.execute("PRAGMA table_info(tools)")
+        columns = [col[1] for col in cur.fetchall()]
+        if "version_command" not in columns:
+            cur.execute("ALTER TABLE tools ADD COLUMN version_command TEXT")
+            logger.info("Added version_command column to tools table.")
+
+        # Upsert tools from catalog
+        for key, t in TOOLS.items():
+            cur.execute("""
+                INSERT OR REPLACE INTO tools
+                (tool_key, name, category, description, install_command, version_command, parameters)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (key, t["name"], t["category"], t["description"],
+                  t["install_command"], t.get("version_command", ""),
+                  json.dumps(t["parameters"])))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized with {len(TOOLS)} tools.")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        raise  # Re-raise to prevent app from running with broken DB
 
 init_db()
 
@@ -572,7 +584,10 @@ def tool_status(tool_key: str) -> dict:
     if not row:
         return {"error": "tool not found"}
     d = dict(row)
-    d["parameters"] = json.loads(d["parameters"])
+    try:
+        d["parameters"] = json.loads(d["parameters"])
+    except:
+        d["parameters"] = []
     return d
 
 def all_tool_statuses() -> List[dict]:
@@ -583,7 +598,10 @@ def all_tool_statuses() -> List[dict]:
     out = []
     for r in rows:
         d = dict(r)
-        d["parameters"] = json.loads(d["parameters"])
+        try:
+            d["parameters"] = json.loads(d["parameters"])
+        except:
+            d["parameters"] = []
         out.append(d)
     return out
 
@@ -1309,7 +1327,7 @@ async def ws_terminal(ws: WebSocket):
         return
 
 # ==============================================================================
-# FRONTEND (HTML) – Enhanced version (unchanged except version)
+# FRONTEND (HTML) – Enhanced with error handling
 # ==============================================================================
 
 HTML_PAGE = """
@@ -1317,7 +1335,7 @@ HTML_PAGE = """
 <html>
 <head>
 <meta charset="utf-8"/>
-<title>GenomeOps Workbench v1.2.2</title>
+<title>GenomeOps Workbench v1.2.3</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
 <style>
 :root{
@@ -1368,13 +1386,14 @@ footer{background:#1e293b;color:#cbd5e1;padding:24px;border-radius:16px 16px 0 0
 .spinner{display:inline-block;width:16px;height:16px;border:3px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s ease-in-out infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .tool-search{margin-bottom:12px;padding:8px;border-radius:20px;border:1px solid var(--line);width:100%}
+.error-message{color:var(--red); font-weight:bold; padding:10px; background:#fee; border-radius:8px;}
 @media(max-width:1100px){.grid{grid-template-columns:1fr}.row2{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1><i class="fas fa-dna"></i> GenomeOps Workbench v1.2.2</h1>
-  <p>Fixed Prokka – now forces system blastp via PATH override</p>
+  <h1><i class="fas fa-dna"></i> GenomeOps Workbench v1.2.3</h1>
+  <p>Fixed database init – tools should now appear</p>
 </div>
 
 <div class="wrap">
@@ -1473,7 +1492,7 @@ footer{background:#1e293b;color:#cbd5e1;padding:24px;border-radius:16px 16px 0 0
         <i class="fas fa-globe"></i> <a href="https://sites.google.com/view/nahiduzzaman-bau/home" target="_blank">sites.google.com/view/nahiduzzaman-bau</a><br>
         <i class="fas fa-envelope"></i> <a href="mailto:nahiduzzaman.2001055@bau.edu.bd">nahiduzzaman.2001055@bau.edu.bd</a>
       </p>
-      <p><small>Version 1.2.2 – GenomeOps Workbench</small></p>
+      <p><small>Version 1.2.3 – GenomeOps Workbench</small></p>
     </div>
   </footer>
 </div>
@@ -1501,20 +1520,30 @@ async function api(url, method="GET", body=null){
   const opts = {method, headers:{}};
   if(body){opts.headers["Content-Type"]="application/json"; opts.body=JSON.stringify(body);}
   const res = await fetch(url, opts);
-  let data = await res.json();
-  if(!res.ok){ throw new Error(data.detail || data.error || "Request failed");}
-  return data;
+  if (!res.ok) {
+    let errorDetail = `HTTP ${res.status}`;
+    try {
+      const errData = await res.json();
+      errorDetail = errData.detail || errData.error || JSON.stringify(errData);
+    } catch (e) {}
+    throw new Error(errorDetail);
+  }
+  return await res.json();
 }
 
 async function loadSystem(){
-  const d = await api("/api/system");
-  document.getElementById("systemBox").innerHTML = `
-    <div class="small"><b>Version:</b> ${d.version}</div>
-    <div class="small"><b>Workspace:</b> ${d.workspace}</div>
-    <div class="small"><b>Uploads:</b> ${d.uploads}</div>
-    <div class="small"><b>Results:</b> ${d.results}</div>
-    <div class="small"><b>Files:</b> ${d.n_files} | <b>Jobs:</b> ${d.n_jobs}</div>
-  `;
+  try {
+    const d = await api("/api/system");
+    document.getElementById("systemBox").innerHTML = `
+      <div class="small"><b>Version:</b> ${d.version}</div>
+      <div class="small"><b>Workspace:</b> ${d.workspace}</div>
+      <div class="small"><b>Uploads:</b> ${d.uploads}</div>
+      <div class="small"><b>Results:</b> ${d.results}</div>
+      <div class="small"><b>Files:</b> ${d.n_files} | <b>Jobs:</b> ${d.n_jobs}</div>
+    `;
+  } catch (e) {
+    document.getElementById("systemBox").innerHTML = `<div class="error-message">Failed to load system info: ${e.message}</div>`;
+  }
 }
 
 async function checkPassword(){
@@ -1557,17 +1586,21 @@ function filterTools(){
 }
 
 async function loadTools(){
-  const d = await api("/api/tools");
-  tools = d.tools;
-  filterTools();
+  try {
+    const d = await api("/api/tools");
+    tools = d.tools || [];
+    filterTools();
 
-  const sel = document.getElementById("toolSelect");
-  sel.innerHTML = '<option value="">-- select tool --</option>';
-  for(const t of tools){
-    const opt = document.createElement("option");
-    opt.value = t.tool_key;
-    opt.textContent = `${t.name} | ${t.category}`;
-    sel.appendChild(opt);
+    const sel = document.getElementById("toolSelect");
+    sel.innerHTML = '<option value="">-- select tool --</option>';
+    for(const t of tools){
+      const opt = document.createElement("option");
+      opt.value = t.tool_key;
+      opt.textContent = `${t.name} | ${t.category}`;
+      sel.appendChild(opt);
+    }
+  } catch (e) {
+    document.getElementById("toolsArea").innerHTML = `<div class="error-message">Failed to load tools: ${e.message}</div>`;
   }
 }
 
@@ -1680,6 +1713,11 @@ async function uploadFile(){
   const form = new FormData();
   form.append("file", input.files[0]);
   const res = await fetch("/api/upload", {method:"POST", body:form});
+  if (!res.ok) {
+    const err = await res.json();
+    alert(`Upload failed: ${err.detail || err.error || res.statusText}`);
+    return;
+  }
   const d = await res.json();
   document.getElementById("uploadMsg").innerText = `Uploaded: ${d.original_name} (${d.file_id})`;
   input.value = "";
@@ -1688,35 +1726,39 @@ async function uploadFile(){
 }
 
 async function loadFiles(){
-  const d = await api("/api/files");
-  files = d.files;
+  try {
+    const d = await api("/api/files");
+    files = d.files || [];
 
-  let html = "<table><thead><tr><th>File ID</th><th>Name</th><th>Type</th><th>Size</th><th>Uploaded</th><th></th></tr></thead><tbody>";
-  for (const f of files){
-    html += `<tr>
-      <td>${f.file_id}</td>
-      <td>${f.original_name}</td>
-      <td>${f.extension || '-'}</td>
-      <td>${f.size_bytes}</td>
-      <td>${f.uploaded_at}</td>
-      <td><button class="gray" onclick="previewFile('${f.file_id}')"><i class="fas fa-eye"></i></button></td>
-    </tr>`;
-  }
-  html += "</tbody></table>";
-  document.getElementById("filesArea").innerHTML = html;
-
-  for (const id of ["assemblyFile","metaFile"]){
-    const sel = document.getElementById(id);
-    sel.innerHTML = '<option value="">-- select file --</option>';
-    for(const f of files){
-      const opt = document.createElement("option");
-      opt.value = f.file_id;
-      opt.textContent = `${f.original_name} [${f.file_id}]`;
-      sel.appendChild(opt);
+    let html = "<table><thead><tr><th>File ID</th><th>Name</th><th>Type</th><th>Size</th><th>Uploaded</th><th></th></tr></thead><tbody>";
+    for (const f of files){
+      html += `<tr>
+        <td>${f.file_id}</td>
+        <td>${f.original_name}</td>
+        <td>${f.extension || '-'}</td>
+        <td>${f.size_bytes}</td>
+        <td>${f.uploaded_at}</td>
+        <td><button class="gray" onclick="previewFile('${f.file_id}')"><i class="fas fa-eye"></i></button></td>
+      </tr>`;
     }
-  }
-  if(selectedTool && selectedTool.installed){
-    renderToolForm(selectedTool);
+    html += "</tbody></table>";
+    document.getElementById("filesArea").innerHTML = html;
+
+    for (const id of ["assemblyFile","metaFile"]){
+      const sel = document.getElementById(id);
+      sel.innerHTML = '<option value="">-- select file --</option>';
+      for(const f of files){
+        const opt = document.createElement("option");
+        opt.value = f.file_id;
+        opt.textContent = `${f.original_name} [${f.file_id}]`;
+        sel.appendChild(opt);
+      }
+    }
+    if(selectedTool && selectedTool.installed){
+      renderToolForm(selectedTool);
+    }
+  } catch (e) {
+    document.getElementById("filesArea").innerHTML = `<div class="error-message">Failed to load files: ${e.message}</div>`;
   }
 }
 
@@ -1737,17 +1779,25 @@ function closePreview(){
 async function runAssemblyStats(){
   const file_id = document.getElementById("assemblyFile").value;
   if(!file_id){ alert("Select a FASTA file."); return; }
-  const d = await api("/api/run/assembly-stats", "POST", {file_id});
-  alert("Job submitted: " + d.job_id);
-  loadJobs();
+  try {
+    const d = await api("/api/run/assembly-stats", "POST", {file_id});
+    alert("Job submitted: " + d.job_id);
+    loadJobs();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 async function runMetadataSummary(){
   const file_id = document.getElementById("metaFile").value;
   if(!file_id){ alert("Select a CSV file."); return; }
-  const d = await api("/api/run/metadata-summary", "POST", {file_id});
-  alert("Job submitted: " + d.job_id);
-  loadJobs();
+  try {
+    const d = await api("/api/run/metadata-summary", "POST", {file_id});
+    alert("Job submitted: " + d.job_id);
+    loadJobs();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 async function cancelJob(jobId){
@@ -1767,23 +1817,27 @@ async function cancelJob(jobId){
 }
 
 async function loadJobs(){
-  const d = await api("/api/jobs");
-  let html = '<table><thead><tr><th>Job ID</th><th>Title</th><th>Status</th><th>Created</th><th>Action</th></tr></thead><tbody>';
-  for(const j of d.jobs){
-    html += `<tr>
-      <td>${j.job_id}</td>
-      <td>${j.title}</td>
-      <td><b>${j.status}</b></td>
-      <td>${j.created_at}</td>
-      <td>
-        <button onclick="showLog('${j.job_id}')"><i class="fas fa-file-alt"></i> Log</button>
-        ${j.status === 'running' ? `<button class="red" onclick="cancelJob('${j.job_id}')"><i class="fas fa-ban"></i> Cancel</button>` : ''}
-        ${j.result_dir ? `<a href="/api/jobs/${j.job_id}/download" target="_blank"><button class="gray"><i class="fas fa-download"></i> Result</button></a>` : ''}
-      </td>
-    </tr>`;
+  try {
+    const d = await api("/api/jobs");
+    let html = '<table><thead><tr><th>Job ID</th><th>Title</th><th>Status</th><th>Created</th><th>Action</th></tr></thead><tbody>';
+    for(const j of d.jobs){
+      html += `<tr>
+        <td>${j.job_id}</td>
+        <td>${j.title}</td>
+        <td><b>${j.status}</b></td>
+        <td>${j.created_at}</td>
+        <td>
+          <button onclick="showLog('${j.job_id}')"><i class="fas fa-file-alt"></i> Log</button>
+          ${j.status === 'running' ? `<button class="red" onclick="cancelJob('${j.job_id}')"><i class="fas fa-ban"></i> Cancel</button>` : ''}
+          ${j.result_dir ? `<a href="/api/jobs/${j.job_id}/download" target="_blank"><button class="gray"><i class="fas fa-download"></i> Result</button></a>` : ''}
+        </td>
+      </tr>`;
+    }
+    html += "</tbody></table>";
+    document.getElementById("jobsArea").innerHTML = html;
+  } catch (e) {
+    document.getElementById("jobsArea").innerHTML = `<div class="error-message">Failed to load jobs: ${e.message}</div>`;
   }
-  html += "</tbody></table>";
-  document.getElementById("jobsArea").innerHTML = html;
 }
 
 async function showLog(jobId){
@@ -1811,7 +1865,7 @@ function connectTerminal(){
 
   termSocket.onopen = () => {
     termReady = true;
-    document.getElementById("termOut").textContent += "Terminal connected.\n";
+    document.getElementById("termOut").textContent += "Terminal connected.\\n";
     const password = document.getElementById("password").value;
     if(password){
       termSocket.send(JSON.stringify({type:"auth", password}));
@@ -1821,21 +1875,21 @@ function connectTerminal(){
   termSocket.onmessage = (event) => {
     const d = JSON.parse(event.data);
     if(d.type === "welcome"){
-      document.getElementById("termOut").textContent += d.message + "\n";
+      document.getElementById("termOut").textContent += d.message + "\\n";
     } else if(d.type === "auth"){
       if(d.ok){
-        document.getElementById("termOut").textContent += "Terminal authenticated.\n";
+        document.getElementById("termOut").textContent += "Terminal authenticated.\\n";
         document.getElementById("termCwd").innerText = "cwd: " + d.cwd;
       } else {
-        document.getElementById("termOut").textContent += "Authentication failed.\n";
+        document.getElementById("termOut").textContent += "Authentication failed.\\n";
       }
     } else if(d.type === "result"){
       document.getElementById("termCwd").innerText = "cwd: " + d.cwd;
-      if(d.stdout) document.getElementById("termOut").textContent += d.stdout + "\n";
-      if(d.stderr) document.getElementById("termOut").textContent += d.stderr + "\n";
-      document.getElementById("termOut").textContent += `[exit=${d.returncode}]\n`;
+      if(d.stdout) document.getElementById("termOut").textContent += d.stdout + "\\n";
+      if(d.stderr) document.getElementById("termOut").textContent += d.stderr + "\\n";
+      document.getElementById("termOut").textContent += `[exit=${d.returncode}]\\n`;
     } else if(d.type === "error"){
-      document.getElementById("termOut").textContent += d.error + "\n";
+      document.getElementById("termOut").textContent += d.error + "\\n";
     }
     const pre = document.getElementById("termOut");
     pre.scrollTop = pre.scrollHeight;
@@ -1843,7 +1897,7 @@ function connectTerminal(){
 
   termSocket.onclose = () => {
     termReady = false;
-    document.getElementById("termOut").textContent += "Terminal disconnected.\n";
+    document.getElementById("termOut").textContent += "Terminal disconnected.\\n";
   };
 }
 
@@ -1856,7 +1910,7 @@ function termRun(){
         const cmd = document.getElementById("termCmd").value.trim();
         if(!cmd) return;
         termSocket.send(JSON.stringify({type:"run", command:cmd}));
-        document.getElementById("termOut").textContent += `$ ${cmd}\n`;
+        document.getElementById("termOut").textContent += `$ ${cmd}\\n`;
         document.getElementById("termCmd").value = "";
       } else {
         alert("Terminal not connected. Try again.");
@@ -1867,7 +1921,7 @@ function termRun(){
   const cmd = document.getElementById("termCmd").value.trim();
   if(!cmd) return;
   termSocket.send(JSON.stringify({type:"run", command:cmd}));
-  document.getElementById("termOut").textContent += `$ ${cmd}\n`;
+  document.getElementById("termOut").textContent += `$ ${cmd}\\n`;
   document.getElementById("termCmd").value = "";
 }
 
@@ -1889,4 +1943,4 @@ window.onload = async function(){
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
