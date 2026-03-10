@@ -218,24 +218,11 @@ TOOLS = {
     "category": "Annotation",
     "description": "Rapid prokaryotic genome annotation",
     "install_command": (
-        "set -e && "
-        "apt-get update && "
-        "apt-get install -y git perl bioperl ncbi-blast+ hmmer barrnap aragorn prodigal libdatetime-perl && "
-        "rm -rf /opt/prokka && "
-        "git clone https://github.com/tseemann/prokka.git /opt/prokka && "
-        "chmod +x /opt/prokka/bin/prokka && "
-        "ln -sf /opt/prokka/bin/prokka /usr/local/bin/prokka && "
-        "mkdir -p /opt/conda/bin && "
-        "ln -sf /opt/prokka/bin/prokka /opt/conda/bin/prokka && "
-        "export PATH=/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:$PATH && "
-        "/opt/prokka/bin/prokka --setupdb"
+        "bash -lc 'source ~/miniconda3/etc/profile.d/conda.sh && "
+        "conda create -n prokka_env -c conda-forge -c bioconda -y "
+        "prokka=1.14.6 bioperl=1.7.2'"
     ),
-    "version_command": (
-        "bash -lc 'export PATH=/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:$PATH && "
-        "if command -v prokka >/dev/null 2>&1; then prokka --version; "
-        "elif [ -x /opt/prokka/bin/prokka ]; then /opt/prokka/bin/prokka --version; "
-        "else exit 1; fi'"
-    ),
+    "version_command": "bash -lc 'source ~/miniconda3/etc/profile.d/conda.sh && conda run -n prokka_env prokka --version'",
     "parameters": [
         {
             "name": "input",
@@ -1184,35 +1171,85 @@ async def api_run_metadata_summary(req: MetadataSummaryRequest):
 async def api_run_tool_dynamic(req: ToolRunDynamicRequest):
     if req.password != APP_PASSWORD:
         raise HTTPException(status_code=401, detail="Wrong password.")
+
     conn = db()
     cur = conn.cursor()
     row = cur.execute("SELECT * FROM tools WHERE tool_key = ?", (req.tool_key,)).fetchone()
     conn.close()
+
     if not row:
         raise HTTPException(status_code=404, detail="Tool not found")
+
     tool = dict(row)
     if not tool["installed"]:
         raise HTTPException(status_code=400, detail="Tool not installed. Please install it first.")
-    parameters = json.loads(tool["parameters"])
+
+    try:
+        parameters = json.loads(tool["parameters"]) if tool["parameters"] else []
+    except Exception:
+        raise HTTPException(status_code=500, detail="Invalid tool parameter definition.")
 
     work_dir = RESULT_DIR / f"{req.tool_key}_{uuid.uuid4().hex[:8]}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    env["PATH"] = "/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
+    env["PATH"] = "/opt/conda/bin:/opt/prokka/bin:/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
+    env["HOME"] = str(Path.home())
 
-    if req.tool_key == "prokka":
-        if os.path.exists("/opt/prokka/bin/prokka"):
-            cmd_parts = ["/opt/prokka/bin/prokka"]
-        elif os.path.exists("/usr/local/bin/prokka"):
-            cmd_parts = ["/usr/local/bin/prokka"]
-        else:
-            cmd_parts = ["prokka"]
-    else:
-        cmd_parts = [req.tool_key]
+    # Map tools to dedicated conda environments where needed
+    tool_env_map = {
+        "prokka": "prokka_env",
+        "gubbins": "gubbins_env",
+        "roary": "roary_env",
+        "snippy": "epi310",
+        "abricate": "epi310",
+        "mlst": "epi310",
+        "snp-sites": "epi310",
+        "iqtree": "epi310",
+        "raxml-ng": "epi310",
+        "mafft": "epi310",
+        "muscle": "epi310",
+        "clustalo": "epi310",
+        "cd-hit": "epi310",
+        "mash": "epi310",
+        "flye": "epi310",
+    }
+
+    def build_base_command(tool_key: str) -> list[str]:
+        """
+        Return command prefix as a list. Tools in conda envs are run via:
+        bash -lc 'source ... && conda run -n ENV TOOL'
+        """
+        conda_sh = "~/miniconda3/etc/profile.d/conda.sh"
+        env_name = tool_env_map.get(tool_key)
+
+        if env_name:
+            return [
+                "bash",
+                "-lc",
+                f"source {conda_sh} && conda run -n {shlex.quote(env_name)} {shlex.quote(tool_key)}"
+            ]
+
+        # Special case: allow direct system binary fallback for prokka if needed
+        if tool_key == "prokka":
+            return [
+                "bash",
+                "-lc",
+                "if [ -x /opt/prokka/bin/prokka ]; then /opt/prokka/bin/prokka; "
+                "elif [ -x /usr/local/bin/prokka ]; then /usr/local/bin/prokka; "
+                "else prokka; fi"
+            ]
+
+        return [tool_key]
+
+    base_cmd = build_base_command(req.tool_key)
+
+    # We will append arguments separately, then shell-quote safely
+    arg_parts: list[str] = []
 
     for param in parameters:
         pname = param["name"]
+
         if pname not in req.values:
             if param.get("required", False):
                 raise HTTPException(status_code=400, detail=f"Missing required parameter: {pname}")
@@ -1222,35 +1259,56 @@ async def api_run_tool_dynamic(req: ToolRunDynamicRequest):
         if value is None or value == "":
             continue
 
-        if param["type"] == "file":
+        ptype = param.get("type", "").lower()
+
+        if ptype == "file":
             file_rec = get_file(value)
             if not file_rec:
-                raise HTTPException(status_code=400, detail=f"File not found for parameter {pname}")
+                raise HTTPException(status_code=400, detail=f"File not found for parameter: {pname}")
 
             file_path = Path(file_rec["path"])
+            if not file_path.exists():
+                raise HTTPException(status_code=400, detail=f"File path does not exist: {file_path}")
 
+            # MultiQC usually wants a directory
             if req.tool_key == "multiqc" and pname == "input_dir":
                 file_path = file_path.parent
 
-            if req.tool_key == "prokka":
-                cmd_parts.append(shlex.quote(str(file_path)))
+            # Positional input for some tools
+            if req.tool_key in {"prokka"} and pname == "input":
+                arg_parts.append(shlex.quote(str(file_path)))
             else:
-                cmd_parts.append(shlex.quote(str(file_path)))
+                arg_parts.append(f"--{pname}")
+                arg_parts.append(shlex.quote(str(file_path)))
 
-        elif param["type"] in ("text", "number", "select"):
-            cmd_parts.append(f"--{pname}")
-            cmd_parts.append(shlex.quote(str(value)))
+        elif ptype in {"text", "number", "select"}:
+            # Keep input positional for tools that need it
+            if req.tool_key in {"multiqc"} and pname == "input_dir":
+                arg_parts.append(shlex.quote(str(value)))
+            else:
+                arg_parts.append(f"--{pname}")
+                arg_parts.append(shlex.quote(str(value)))
 
-        elif param["type"] == "flag":
+        elif ptype == "flag":
             if value:
-                cmd_parts.append(f"--{pname}")
+                arg_parts.append(f"--{pname}")
 
-    command = " ".join(cmd_parts)
+    # Build final command safely
+    if base_cmd[:2] == ["bash", "-lc"]:
+        # For conda-run tools, the third element is the shell command prefix
+        shell_cmd = base_cmd[2]
+        if arg_parts:
+            shell_cmd = f"{shell_cmd} " + " ".join(arg_parts)
+        command = shell_cmd
+    else:
+        command = " ".join([shlex.quote(part) for part in base_cmd] + arg_parts)
 
     job_id = create_job("tool", f"Run {tool['name']}", command)
     update_job(job_id, result_dir=str(work_dir))
+
     asyncio.create_task(run_job_command(job_id, command, work_dir, env=env))
     return {"job_id": job_id, "command": command}
+
 
 @app.get("/api/jobs")
 async def api_jobs():
