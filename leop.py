@@ -212,12 +212,17 @@ TOOLS = {
 
     # ---------- Annotation ----------
     "prokka": {
-        "name": "Prokka",
-        "category": "Annotation",
-        "description": "Rapid prokaryotic genome annotation",
-        "install_command": "apt-get update && apt-get install -y prokka",
-        "version_command": "prokka --version",
-        "parameters": [
+    "name": "Prokka",
+    "category": "Annotation",
+    "description": "Rapid prokaryotic genome annotation",
+    "install_command": (
+        "apt-get update && apt-get install -y git perl bioperl ncbi-blast+ && "
+        "git clone https://github.com/tseemann/prokka.git /opt/prokka && "
+        "cd /opt/prokka && /opt/prokka/bin/prokka --setupdb && "
+        "ln -sf /opt/prokka/bin/prokka /usr/local/bin/"
+    ),
+    "version_command": "prokka --version",
+    "parameters": [
             {"name": "input", "label": "Genome FASTA", "type": "file", "required": True,
              "extensions": [".fa", ".fna", ".fasta", ".fas"], "help": "Assembly in FASTA format"},
             {"name": "prefix", "label": "Output prefix", "type": "text", "default": "prokka"},
